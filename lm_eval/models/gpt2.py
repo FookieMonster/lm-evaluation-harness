@@ -1,6 +1,11 @@
+from typing import Optional
+
+import jax
+import jax.numpy as jnp
+import numpy as np
 import torch
 import transformers
-from typing import Optional, Union
+
 from lm_eval.base import BaseLM
 
 
@@ -127,6 +132,110 @@ class HFLM(BaseLM):
             pad_token_id=eos_token_id,
             do_sample=False,
         )
+
+
+class HFFLAXLM(BaseLM):
+    def __init__(
+        self,
+        pretrained,
+        revision="main",
+        subfolder=None,
+        tokenizer=None,
+        batch_size=1,
+        trust_remote_code: Optional[bool] = False,
+        use_fast: Optional[bool] = False,
+    ):
+        super().__init__()
+
+        assert isinstance(pretrained, str)
+        assert isinstance(batch_size, int)
+
+        revision = revision + ("/" + subfolder if subfolder is not None else "")
+
+        self.model = transformers.FlaxAutoModelForCausalLM.from_pretrained(
+            pretrained,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+        )
+
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+            pretrained if tokenizer is None else tokenizer,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+        )
+        self.vocab_size = self.tokenizer.vocab_size
+        self.batch_size_per_gpu = batch_size
+        self.count = 0
+
+    @property
+    def eot_token_id(self):
+        return self.tokenizer.eos_token_id
+
+    @property
+    def max_length(self):
+        return self.model.config.max_len
+
+    @property
+    def max_gen_toks(self):
+        return 256
+
+    @property
+    def batch_size(self):
+        return self.batch_size_per_gpu
+
+    @property
+    def device(self):
+        return torch.device("cpu")
+
+    def tok_encode(self, string: str):
+        return self.tokenizer.encode(string, add_special_tokens=False)
+
+    def tok_decode(self, tokens):
+        return self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+    def jax_to_torch(self, jax_array):
+        numpy_array = np.array(jax_array, dtype=np.float32)
+        torch_tensor = torch.from_numpy(numpy_array)
+        return torch_tensor
+
+    def torch_to_jax(self, torch_tensor):
+        numpy_array = torch_tensor.numpy()
+        jax_array = jnp.array(numpy_array)
+        return jax_array
+
+    def _model_call(self, inps):
+        jax_inps = self.torch_to_jax(inps)
+
+        model_kwargs = self.model.prepare_inputs_for_generation(jax_inps, self.max_length, None)
+        model_outputs = self.model(jax_inps, params=None, **model_kwargs)
+
+        # Workaround: avoid out of memory error
+        self.count = self.count + 1
+        if self.count % 100 == 0:
+            jax.clear_caches()
+
+        logits = model_outputs["logits"]
+        torch_logits = self.jax_to_torch(logits)
+        return torch_logits
+
+    def _model_generate(self, context, max_length, eos_token_id):
+        input_ids = self.torch_to_jax(context)
+
+        output = self.model.generate(
+            input_ids,
+            max_length=max_length,
+            eos_token_id=eos_token_id,
+            pad_token_id=eos_token_id,
+            do_sample=False,
+        )
+
+        # Workaround: avoid out of memory error
+        self.count = self.count + 1
+        if self.count % 100 == 0:
+            jax.clear_caches()
+
+        return output[0]
 
 
 # for backwards compatibility
